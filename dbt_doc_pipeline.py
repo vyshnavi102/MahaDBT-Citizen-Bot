@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-import logging
 import re
 from typing import TypedDict
 
@@ -10,6 +9,9 @@ from qdrant_client import QdrantClient
 from config import config_path
 from custom_slm import slm
 from langgraph.graph import StateGraph, END
+from config.logger_util import get_logger, LogTimer, log_execution, get_current_logger
+
+logger = get_current_logger()
 
 # -------------------- CONFIG --------------------
 with open(os.path.join(config_path, "config.json"), "r", encoding="utf-8") as CONFIG:
@@ -18,19 +20,16 @@ with open(os.path.join(config_path, "config.json"), "r", encoding="utf-8") as CO
 __import__("pysqlite3")
 sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 base_dir = os.path.dirname(os.path.abspath(__file__))
-QDRANT_PATH = os.path.join(base_dir, "qdrant_dbt_schemes_storage")
-COLLECTION_NAME = "dbt_scheme_embeddings"
+QDRANT_PATH = os.path.join(base_dir, "dbt_test_storage")
+COLLECTION_NAME = "dbt_test_embeddings"
 
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 client = QdrantClient(path=QDRANT_PATH)
 
 # -------------------- FILTER + RETRIEVAL --------------------
 
-def retrieve_scheme_names(question: str):
+def retrieve_scheme_names(question: str, logger):
     records, _ = client.scroll(collection_name=COLLECTION_NAME, limit=2000)
     filters = extract_filters_slm(question)
     #logger.info(f"[FILTERS] Extracted: {filters}")
@@ -149,15 +148,184 @@ def normalize_classes(class_list):
 
     return normalized
 
+def detect_scope_slm(question: str):
+    prompt = f"""
+You are a strict classifier.
+
+Your job:
+Decide whether the user question is related to STUDENT SCHOLARSHIP SCHEMES.
+
+Return ONLY JSON:
+
+{{
+  "in_scope": true/false,
+  "reason": "short reason"
+}}
+
+Rules:
+- TRUE → if question is about students, scholarships, education benefits
+- FALSE → if question is about farmers, jobs, pensions, business, etc.
+- Be strict
+- Do NOT assume anything
+
+Question:
+{question}
+"""
+
+    try:
+        response = slm.invoke(prompt)
+
+        # Extract JSON safely
+        import re, json
+        match = re.search(r'\{.*\}', response, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+    except Exception as e:
+        print("Scope detection error:", e)
+
+    # fallback
+    return {"in_scope": True, "reason": "fallback"}
+
 # -------------------- FILTER LOGIC --------------------
 
 def extract_filters_slm(question: str):
     prompt = f"""
-Extract filters as JSON.
+You are a strict JSON filter extractor.
 
-Question: {question}
+Your task:
+Extract filter values from the question.
 
-Output format:
+------------------------
+OUTPUT RULES (VERY STRICT):
+
+- Return ONLY valid JSON
+- No explanation
+- No extra text
+- Start with {{ and end with }}
+- Use double quotes only
+- No trailing commas
+
+------------------------
+EXTRACTION INSTRUCTIONS (VERY IMPORTANT):
+
+1. CASTE:
+- If ANY caste word is present in the question (SC, ST, OBC, SBC, VJNT, etc.)
+  → YOU MUST add it to "caste"
+- Do NOT skip it
+- Do NOT leave it empty if present
+- Return as list
+- Example: "sc students" → ["SC"]
+
+2. GENDER:
+- If ANY gender-related word is present
+  → YOU MUST set gender
+- girls/female → "Female"
+- boys/male → "Male"
+- Do NOT leave null if present
+
+3. CLASSES (VERY IMPORTANT - GENERAL RULE FOR ALL CLASSES):
+
+- If ANY class number is mentioned in the question → YOU MUST extract it
+- This applies to ALL class numbers (1 to 12), not just specific examples
+
+You MUST handle ALL formats:
+
+1. Numbers:
+- "class 8", "class 9", "class 10" → [8], [9], [10]
+
+2. Ordinal forms:
+- "8th", "9th", "10th" → [8], [9], [10]
+
+3. Multiple classes:
+- "6th and 7th" → [6,7]
+- "8, 9, 10" → [8,9,10]
+
+4. Range:
+- "6 to 8" → [6,7,8]
+- "6th to 8th" → [6,7,8]
+
+5. ROMAN NUMERALS (VERY IMPORTANT - APPLY TO ALL):
+
+- Roman numerals represent class numbers from 1 to 12
+
+You MUST convert ALL roman numerals correctly:
+
+I → 1
+II → 2
+III → 3
+IV → 4
+V → 5
+VI → 6
+VII → 7
+VIII → 8
+IX → 9
+X → 10
+XI → 11
+XII → 12
+
+------------------------
+
+RANGE HANDLING:
+
+- If a range is given → convert both and include all numbers between
+
+Examples:
+
+- "VIII" → [8]
+- "VII" → [7]
+- "X" → [10]
+
+- "VIII to X" → [8,9,10]
+- "VII to IX" → [7,8,9]
+- "V to VII" → [5,6,7]
+
+------------------------
+
+IMPORTANT:
+
+- Apply this conversion to ALL roman numerals, not just IX
+- Do NOT skip any roman numeral
+- Always convert to integers
+- Always return full range when "to" or "-" is present
+
+6. Mixed:
+- "8th to X" → [8,9,10]
+- "IX to 12" → [9,10,11,12]
+
+IMPORTANT:
+- Apply this logic to ALL class numbers (1–12)
+- Do NOT focus only on examples like 9
+- Ignore words like "class", "th", "std"
+- Always convert to integers
+- Always return a list
+
+- If class is present → MUST extract
+- If not present → return []
+
+4. CLASS TYPE:
+- If "pre matric" → "pre_matric"
+- If "post matric" → "post_matric"
+- If class_type is present → classes MUST be []
+
+5. HOSTELLER:
+- If "hostel" or "hosteller" is present
+  → YOU MUST set "yes"
+
+6. DISABLED:
+- If "disabled" or "handicapped" is present
+  → YOU MUST set "yes"
+
+------------------------
+CRITICAL RULES:
+
+- If a value is clearly present in the question → YOU MUST extract it
+- Do NOT ignore obvious words like "sc", "girls", "class 9"
+- Do NOT leave fields empty if they are present in the question
+- Only leave empty/null if truly not mentioned
+
+------------------------
+OUTPUT FORMAT:
+
 {{
   "caste": [],
   "gender": null,
@@ -166,6 +334,13 @@ Output format:
   "hosteller": null,
   "disabled": null
 }}
+
+------------------------
+
+Question:
+{question}
+
+Output:
 """
     response = slm.invoke(prompt)
 
@@ -213,7 +388,10 @@ def match_filters(payload, filters):
 
     # ---------- GENDER ----------
     if filters.get("gender"):
-        if not any(filters["gender"].lower() in g.lower() for g in eligible_genders):
+        if not any(
+            g.lower() == "all" or filters["gender"].lower() == g.lower()
+            for g in eligible_genders
+        ):
             return False
 
     # ---------- CLASS TYPE ----------
@@ -233,17 +411,22 @@ def match_filters(payload, filters):
             return False
 
     # ---------- HOSTELLER ----------
-    if filters.get("hosteller") is True:
+    if filters.get("hosteller") in [True, "yes"]:
         # empty list means not applicable
         if not hostellers:
             return False
 
     # ---------- DISABLED ----------
-    if filters.get("disabled") is True:
+    if filters.get("disabled") in [True, "yes"]:
         if not disabled:
             return False
 
     return True
+
+def route_scope(state):
+    if state.get("in_scope") == False:
+        return "out_of_scope"
+    return "intent"
 
 # -------------------- INTENT --------------------
 
@@ -276,55 +459,164 @@ class GraphState(TypedDict):
     count: int
     chunks: list
     answer: str
+    in_scope: bool
+    scope_reason: str
+   
 
 # -------------------- NODES --------------------
 
 def intent_node(state: GraphState):
-    res = intent_classification(state["question"])
-    state["intent"] = res.get("intent", "scheme_details")
+    logger = get_current_logger()
+
+    with LogTimer(logger, "intent_node"):
+        res = intent_classification(state["question"])
+        state["intent"] = res.get("intent", "scheme_details")
+
+        logger.info(f"Detected intent: {state['intent']}")
+
     return state
 
 
 def list_or_count_node(state: GraphState):
-    schemes = retrieve_scheme_names(state["question"])
-    state["schemes"] = schemes
-    state["count"] = len(schemes)
+    logger = get_current_logger()
+
+    with LogTimer(logger, "list_or_count_node"):
+        schemes = retrieve_scheme_names(state["question"], logger)
+
+        state["schemes"] = schemes
+        state["count"] = len(schemes)
+
+        logger.info(f"Schemes found: {state['count']}")
+
     return state
 
 
 def format_list_node(state: GraphState):
-    state["answer"] = format_scheme_list(state["question"], state["schemes"])
-    return state
+    logger = get_current_logger()
 
+    with LogTimer(logger, "format_list_node"):
+        state["answer"] = format_scheme_list(state["question"], state["schemes"])
+
+    return state
 
 def format_count_node(state: GraphState):
-    state["answer"] = format_count_answer(state["question"], state["count"])
-    return state
+    logger = get_current_logger()
 
+    with LogTimer(logger, "format_count_node"):
+        state["answer"] = format_count_answer(state["question"], state["count"])
+
+    return state
 
 def retrieve_chunks_node(state: GraphState):
-    state["chunks"] = retrieve_relevant_chunks(state["question"])
+    logger = get_current_logger()
+
+    with LogTimer(logger, "retrieve_chunks_node"):
+        state["chunks"] = retrieve_relevant_chunks(state["question"])
+
+        logger.info(f"Chunks retrieved: {len(state['chunks'])}")
+
     return state
 
+def scope_node(state: dict):
+    question = state["question"]
+
+    result = detect_scope_slm(question)
+
+    state["in_scope"] = result.get("in_scope", True)
+    state["scope_reason"] = result.get("reason", "")
+
+    return state
+
+def out_of_scope_node(state: dict):
+    return {
+        "answer": "Currently, we provide only student scholarship schemes. Your query seems outside this scope."
+    }
 
 def generate_answer_node(state: GraphState):
-    if not state["chunks"]:
-        state["answer"] = "can't answer this question based on available documents"
-        return state
+    logger = get_current_logger()
 
-    context = "\n\n".join(state["chunks"])
+    with LogTimer(logger, "generate_answer_node"):
 
-    prompt = f"""
-Answer using context only.
+        if not state["chunks"]:
+            logger.warning("No chunks found")
+            state["answer"] = "can't answer this question based on available documents"
+            return state
+
+        context = "\n\n".join(state["chunks"])
+
+        prompt = f"""
+You are a government scheme assistant.
+
+STRICT RULES:
+1. Answer ONLY using the given context.
+2. Do NOT assume missing information.
+3. Use very simple English.
+4. Keep sentences short.
+5. No unnecessary explanation.
+
+CRITICAL RULE (VERY IMPORTANT):
+- Identify what the user is asking:
+    • If question is about eligibility → ONLY show Eligibility
+    • If question is about benefits → ONLY show Benefits
+    • If question is about documents → ONLY show Documents
+    • If question is about summary → ONLY show Summary
+    • If question is general → show all relevant fields
+
+- DO NOT include any other fields.
+- DO NOT dump full scheme details unless explicitly asked.
+
+FORMATTING RULES:
+- Make the answer clean and readable.
+- Use proper spacing.
+- Highlight headings in bold.
+
+OUTPUT FORMAT:
+
+**<Scheme Name>**
+
+(Only include the requested section below)
+
+**Eligibility:**
+- point 1
+- point 2
+
+OR
+
+**Benefits:**
+- point 1
+- point 2
+
+OR
+
+**Documents:**
+- point 1
+- point 2
+
+OR
+
+**Summary:**
+- short explanation
+
+
+IMPORTANT:
+- Do NOT include extra sections.
+- Do NOT include unnecessary text.
+- Keep output minimal and precise.
 
 Context:
 {context}
 
 Question:
 {state["question"]}
+
+Answer:
 """
-    response = slm.invoke(prompt).strip()
-    state["answer"] = re.sub(r"<think>.*?</think>", "", response)
+
+        response = slm.invoke(prompt).strip()
+        state["answer"] = re.sub(r"<think>.*?</think>", "", response)
+
+        logger.info("Answer generated successfully")
+
     return state
 
 # -------------------- ROUTING --------------------
@@ -344,14 +636,25 @@ def route_list_or_count(state: GraphState):
 
 builder = StateGraph(GraphState)
 
+builder.add_node("scope", scope_node)
 builder.add_node("intent", intent_node)
+builder.add_node("out_of_scope", out_of_scope_node)
 builder.add_node("list_or_count", list_or_count_node)
 builder.add_node("format_list", format_list_node)
 builder.add_node("format_count", format_count_node)
 builder.add_node("retrieve_chunks", retrieve_chunks_node)
 builder.add_node("generate_answer", generate_answer_node)
 
-builder.set_entry_point("intent")
+builder.set_entry_point("scope")
+
+builder.add_conditional_edges(
+    "scope",
+    route_scope,
+    {
+        "intent": "intent",
+        "out_of_scope": "out_of_scope"
+    }
+)
 
 builder.add_conditional_edges("intent", route_intent, {
     "list_or_count": "list_or_count",
@@ -374,7 +677,18 @@ graph = builder.compile()
 # -------------------- WRAPPER --------------------
 
 def generate_answer_from_documents(question: str):
-    result = graph.invoke({"question": question})
+    logger = get_logger()   
+
+    logger.info(f"Incoming question: {question}")
+
+    with LogTimer(logger, "run_pipeline"):
+        result = graph.invoke({
+            "question": question   
+        })
+    logger.info(f"Final answer: {result.get('answer')}")
+
+    logger.info("Pipeline finished successfully")
+
     return result.get("answer", "")
 
 # -------------------- MAIN --------------------
