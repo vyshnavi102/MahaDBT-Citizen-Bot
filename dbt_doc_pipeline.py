@@ -21,8 +21,8 @@ __import__("pysqlite3")
 sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
-QDRANT_PATH = os.path.join(base_dir, "dbt_test_storage")
-COLLECTION_NAME = "dbt_test_embeddings"
+QDRANT_PATH = os.path.join(base_dir, "qdrant_dbt_schemes_storage")
+COLLECTION_NAME = "dbt_scheme_embeddings"
 
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 client = QdrantClient(path=QDRANT_PATH)
@@ -474,6 +474,8 @@ Output:
         #return json.loads(response.strip())
         data = json.loads(response.strip())
         data["classes"] = normalize_classes(data.get("classes", []))
+        if data.get("classes"):
+            data["class_type"] = None
         return data
     except:
         match = re.search(r"\{{.*\}}", response, re.DOTALL)
@@ -521,7 +523,7 @@ def match_filters(payload, filters):
             return False
 
     # ---------- CLASS TYPE ----------
-    if filters.get("class_type"):
+    if filters.get("class_type") and not filters.get("classes"):
         if filters["class_type"] == "pre_matric":
             if not any(c <= 10 for c in eligible_classes):
                 return False
@@ -707,7 +709,7 @@ def generate_answer_node(state: GraphState):
 
         if not state["chunks"]:
             logger.warning("No chunks found")
-            state["answer"] = "can't answer this question based on available documents"
+            state["answer"] = "No schemes found for given criteria."
             return state
 
         context = "\n\n".join(state["chunks"])
@@ -862,6 +864,6 @@ def generate_answer_from_documents(question: str):
 # -------------------- MAIN --------------------
 
 if __name__ == "__main__":
-    q = "I am doing degree 2nd year, what financial help is available?"
+    q = "My daughter is in 9th class and we are from SC category, what help can we get?"
     print(f"Q: {q}")
     print("A: ", generate_answer_from_documents(q))
