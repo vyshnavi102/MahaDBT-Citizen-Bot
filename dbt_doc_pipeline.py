@@ -150,10 +150,69 @@ def normalize_classes(class_list):
 
 def detect_scope_slm(question: str):
     prompt = f"""
-You are a strict classifier.
+You are a STRICT scope classifier for a Government Student Scheme Assistant.
 
 Your job:
-Decide whether the user question is related to STUDENT SCHOLARSHIP SCHEMES.
+Decide whether the user question can be answered using STUDENT SCHEME DATA.
+
+-----------------------------------
+IMPORTANT: WHAT EXISTS IN DATABASE
+
+The database contains schemes related to:
+
+- Scholarships (pre-matric, post-matric, merit)
+- Maintenance allowance
+- Tuition fees / exam fees / freeship
+- Hosteller benefits
+- Sainik school schemes
+- Education financial assistance
+- Caste-based student schemes (SC, OBC, VJNT, SBC)
+- School students (class 1 to 10 mainly)
+
+-----------------------------------
+CLASSIFICATION RULES (VERY IMPORTANT)
+
+Return TRUE if the question is related to ANY of the following:
+
+- Students / school education
+- Financial help for students
+- Scholarships / allowance / freeship / stipend
+- Eligibility / benefits / documents of schemes
+- Specific scheme names
+- School types (Sainik school, govt school, hostel, etc.)
+- Queries like:
+    "eligibility", "benefits", "documents", "how much amount"
+    "which schemes", "available schemes"
+
+EVEN IF the word "scholarship" is NOT present → STILL TRUE
+
+-----------------------------------
+Return FALSE ONLY IF:
+
+- Question is about:
+    - jobs / recruitment
+    - farmers / agriculture
+    - pensions
+    - business / loans
+    - unrelated topics
+
+-----------------------------------
+CRITICAL RULE:
+
+If the question contains ANY of these → ALWAYS TRUE:
+- student
+- class / std
+- school
+- scholarship
+- allowance
+- freeship
+- Sainik school
+- hostel / hosteller
+
+DO NOT be overly strict.
+Prefer TRUE if unsure.
+
+-----------------------------------
 
 Return ONLY JSON:
 
@@ -162,29 +221,24 @@ Return ONLY JSON:
   "reason": "short reason"
 }}
 
-Rules:
-- TRUE → if question is about students, scholarships, education benefits
-- FALSE → if question is about farmers, jobs, pensions, business, etc.
-- Be strict
-- Do NOT assume anything
+-----------------------------------
 
 Question:
 {question}
 """
-
     try:
         response = slm.invoke(prompt)
 
-        # Extract JSON safely
         import re, json
         match = re.search(r'\{.*\}', response, re.DOTALL)
         if match:
             return json.loads(match.group(0))
+
     except Exception as e:
         print("Scope detection error:", e)
 
-    # fallback
     return {"in_scope": True, "reason": "fallback"}
+
 
 # -------------------- FILTER LOGIC --------------------
 
@@ -432,22 +486,58 @@ def route_scope(state):
 
 def intent_classification(question: str):
     prompt = f"""
-Classify intent:
+You are an intent classifier.
 
-- list_schemes
-- count_schemes
-- scheme_details
+Classify the user question into EXACTLY ONE of the following intents:
 
-Question: {question}
+1. count_schemes
+   - The user is asking for the count, number of schemes.
+   - Example: "How many schemes are there?"
 
-Output JSON only.
+2. scheme_details
+   - The user is asking about a specific scheme or detailed info.
+   - Includes questions about:
+     - eligibility
+     - benefits
+     - documents
+     - application process
+     - deadlines
+     - detailed information of a particular scheme
+   - If the user asks about eligibility, benefits, documents, or any detailed info → return scheme_details.
+
+3. list_schemes
+   - The user is asking for the names of multiple schemes.
+   - It can include simple filters like caste, gender, class, or class type.
+   - Must NOT ask for detailed information like eligibility, benefits, or documents.
+   - Example: "List schemes for girls"
+   - Example: "Show post matric schemes for SC students"
+
+IMPORTANT RULES:
+- If the question mentions a specific scheme name → ALWAYS return "scheme_details".
+- If the question explicitly asks about eligibility, benefits, documents, or deadlines → return "scheme_details".
+- If the question is general or filtered (gender, caste, class, hosteller, disabled) → return "list_schemes".
+- If the question asks "how many" or "number of" → return "count_schemes".
+- Return ONLY valid JSON.
+- Do NOT add explanations or extra text.
+
+Question:
+{question}
+
+Final Output:
+{{"intent":"list_schemes"}}
+{{"intent":"count_schemes"}}
+{{"intent":"scheme_details"}}
 """
     text = slm.invoke(prompt)
-
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
-        return json.loads(match.group())
-
+        data = json.loads(match.group())
+        if data.get("intent") in [
+            "list_schemes",
+            "count_schemes",
+            "scheme_details"
+        ]:
+            return data
     return {"intent": "scheme_details"}
 
 # ================= LANGGRAPH =================
@@ -461,7 +551,7 @@ class GraphState(TypedDict):
     answer: str
     in_scope: bool
     scope_reason: str
-   
+
 
 # -------------------- NODES --------------------
 
@@ -677,13 +767,13 @@ graph = builder.compile()
 # -------------------- WRAPPER --------------------
 
 def generate_answer_from_documents(question: str):
-    logger = get_logger()   
+    logger = get_logger()
 
     logger.info(f"Incoming question: {question}")
 
     with LogTimer(logger, "run_pipeline"):
         result = graph.invoke({
-            "question": question   
+            "question": question
         })
     logger.info(f"Final answer: {result.get('answer')}")
 
@@ -694,6 +784,6 @@ def generate_answer_from_documents(question: str):
 # -------------------- MAIN --------------------
 
 if __name__ == "__main__":
-    q = "i am studying 7th standard belongs to sc category, what schemes am i eligible for?"
+    q = "give me eligibility criteria for Maintenance Allowance to SC Students studying in Sainik Schools"
     print(f"Q: {q}")
     print("A: ", generate_answer_from_documents(q))
