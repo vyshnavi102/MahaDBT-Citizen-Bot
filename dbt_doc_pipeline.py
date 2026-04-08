@@ -55,17 +55,70 @@ def retrieve_scheme_names(question: str, logger):
     return matched_schemes
 
 
+# def retrieve_relevant_chunks(question, k=5):
+#     query_vector = embedding_model.encode(question).tolist()
+#     hits = client.search(
+#         collection_name=COLLECTION_NAME,
+#         query_vector=query_vector,
+#         limit=k
+#     )
+
+#     results = []
+#     for hit in hits:
+#         payload = hit.payload or {}
+#         scheme_name = payload.get("scheme_name", "")
+#         eligibility = payload.get("eligibility", [])
+#         benefits = payload.get("benefits", [])
+#         documents = payload.get("documents", [])
+#         summary = payload.get("summary", "")
+
+#         eligibility_text = "\n".join([f"- {e}" for e in eligibility])
+#         benefits_text = "\n".join([
+#             "- " + ", ".join(f"{k}: {v}" for k, v in b.items())
+#             for b in benefits
+#         ])
+#         documents_text = "\n".join([
+#             "- " + ", ".join(f"{k}: {v}" for k, v in d.items())
+#             for d in documents
+#         ])
+
+#         results.append(f"""
+# Scheme: {scheme_name}
+
+# Summary:
+# {summary}
+
+# Eligibility:
+# {eligibility_text}
+
+# Benefits:
+# {benefits_text}
+
+# Documents:
+# {documents_text}
+# """.strip())
+
+#     return results
+
 def retrieve_relevant_chunks(question, k=5):
+    filters = extract_filters_slm(question)
+
     query_vector = embedding_model.encode(question).tolist()
+
     hits = client.search(
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
-        limit=k
+        limit=20   # increase pool
     )
 
     results = []
+
     for hit in hits:
         payload = hit.payload or {}
+
+        if not match_filters(payload, filters):
+            continue
+
         scheme_name = payload.get("scheme_name", "")
         eligibility = payload.get("eligibility", [])
         benefits = payload.get("benefits", [])
@@ -98,8 +151,10 @@ Documents:
 {documents_text}
 """.strip())
 
-    return results
+        if len(results) >= k:
+            break
 
+    return results
 # -------------------- FORMAT --------------------
 
 def format_scheme_list(question: str, schemes):
@@ -369,6 +424,23 @@ IMPORTANT:
 - If "disabled" or "handicapped" is present
   → YOU MUST set "yes"
 
+7. HIGHER EDUCATION (VERY IMPORTANT):
+
+If question contains ANY of:
+- degree
+- college
+- graduation
+- ug / pg
+- engineering
+- medical
+- iti
+- diploma
+
+→ YOU MUST set:
+"class_type": "post_matric"
+
+→ AND classes MUST be []
+
 ------------------------
 CRITICAL RULES:
 
@@ -519,6 +591,12 @@ IMPORTANT RULES:
 - If the question asks "how many" or "number of" → return "count_schemes".
 - Return ONLY valid JSON.
 - Do NOT add explanations or extra text.
+- If question is general like:
+  "what schemes are available"
+  "what financial help"
+  "any scholarships"
+
+→ return "list_schemes"
 
 Question:
 {question}
@@ -784,6 +862,6 @@ def generate_answer_from_documents(question: str):
 # -------------------- MAIN --------------------
 
 if __name__ == "__main__":
-    q = "give me eligibility criteria for Maintenance Allowance to SC Students studying in Sainik Schools"
+    q = "I am doing degree 2nd year, what financial help is available?"
     print(f"Q: {q}")
     print("A: ", generate_answer_from_documents(q))
